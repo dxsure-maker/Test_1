@@ -1,0 +1,35 @@
+name: build-win-exe
+
+on:
+  push:
+    paths:
+      - "06_Default_Sheet_Change_xlsm_to_xlsm/Default_Sheet_Change_MYS_v1.0.py"
+      - ".github/workflows/build-win-exe.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pywin32 pyinstaller
+
+      - name: Build exe
+        run: |
+          pyinstaller --onefile --noconsole --name Default_Sheet_Change_MYS_v1.0 "06_Default_Sheet_Change_xlsm_to_xlsm/Default_Sheet_Change_MYS_v1.0.py"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Default_Sheet_Change_MYS_v1.0
+          path: dist/Default_Sheet_Change_MYS_v1.0.exe
