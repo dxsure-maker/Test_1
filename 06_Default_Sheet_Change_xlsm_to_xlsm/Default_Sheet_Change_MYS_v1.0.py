@@ -131,6 +131,16 @@ class ExcelCopier:
             return
 
         address = source_range.Address
+        start_row = source_range.Row
+        start_col = source_range.Column
+        end_row = start_row + source_range.Rows.Count - 1
+        end_col = start_col + source_range.Columns.Count - 1
+        try:
+            last_cell = source_sheet.Cells.SpecialCells(self.constants["xlCellTypeLastCell"])
+            end_row = max(end_row, last_cell.Row)
+            end_col = max(end_col, last_cell.Column)
+        except Exception:
+            pass
 
         # Copy values and formulas
         target_sheet.Range(address).Formula = source_range.Formula
@@ -150,11 +160,39 @@ class ExcelCopier:
             src_row = source_range.Row + row_idx
             target_sheet.Rows(src_row).RowHeight = source_sheet.Rows(src_row).RowHeight
 
+        # Preserve outline/group settings within used area (and last used cell)
+        self._copy_outline(source_sheet, target_sheet, start_row, end_row, start_col, end_col)
+
     def _get_sheet(self, workbook, name):
         try:
             return workbook.Worksheets(name)
         except Exception:
             return None
+
+    def _copy_outline(self, source_sheet, target_sheet, start_row, end_row, start_col, end_col):
+        try:
+            target_sheet.Outline.SummaryRow = source_sheet.Outline.SummaryRow
+            target_sheet.Outline.SummaryColumn = source_sheet.Outline.SummaryColumn
+        except Exception:
+            pass
+
+        for row_idx in range(start_row, end_row + 1):
+            try:
+                src_row = source_sheet.Rows(row_idx)
+                tgt_row = target_sheet.Rows(row_idx)
+                tgt_row.OutlineLevel = src_row.OutlineLevel
+                tgt_row.Hidden = src_row.Hidden
+            except Exception:
+                pass
+
+        for col_idx in range(start_col, end_col + 1):
+            try:
+                src_col = source_sheet.Columns(col_idx)
+                tgt_col = target_sheet.Columns(col_idx)
+                tgt_col.OutlineLevel = src_col.OutlineLevel
+                tgt_col.Hidden = src_col.Hidden
+            except Exception:
+                pass
 
     def _copy_missing_names(self, source_wb, target_wb):
         existing = {n.Name.lower() for n in target_wb.Names}
@@ -182,10 +220,11 @@ class ExcelCopier:
             self.logger(f"  - Warning: failed to copy defined name '{name_obj.Name}'")
 
     def _build_constants(self):
-        consts = {"xlPasteFormats": -4122}
+        consts = {"xlPasteFormats": -4122, "xlCellTypeLastCell": 11}
         try:
             from win32com.client import constants as excel_consts
             consts["xlPasteFormats"] = getattr(excel_consts, "xlPasteFormats", consts["xlPasteFormats"])
+            consts["xlCellTypeLastCell"] = getattr(excel_consts, "xlCellTypeLastCell", consts["xlCellTypeLastCell"])
         except Exception:
             pass
         return consts
