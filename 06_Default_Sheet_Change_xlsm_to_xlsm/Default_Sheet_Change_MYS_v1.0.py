@@ -8,6 +8,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
+import pywintypes
 import win32com.client as win32
 
 
@@ -146,9 +147,21 @@ class ExcelCopier:
         target_sheet.Range(address).Formula = source_range.Formula
 
         # Copy formats
-        source_range.Copy()
-        target_sheet.Range(address).PasteSpecial(self.constants["xlPasteFormats"])
-        excel.CutCopyMode = False
+        max_cells = 200000
+        cell_count = (end_row - start_row + 1) * (end_col - start_col + 1)
+        if cell_count > max_cells:
+            self._paste_formats_in_chunks(excel, source_sheet, target_sheet, start_row, end_row, start_col, end_col)
+        else:
+            try:
+                source_range.Copy()
+                target_sheet.Range(address).PasteSpecial(self.constants["xlPasteFormats"])
+            except pywintypes.com_error as exc:
+                if self._is_paste_too_long_error(exc):
+                    self._paste_formats_in_chunks(excel, source_sheet, target_sheet, start_row, end_row, start_col, end_col)
+                else:
+                    raise
+            finally:
+                excel.CutCopyMode = False
 
         # Column widths
         for col_idx in range(source_range.Columns.Count):
@@ -168,6 +181,38 @@ class ExcelCopier:
             return workbook.Worksheets(name)
         except Exception:
             return None
+
+    def _is_paste_too_long_error(self, exc):
+        try:
+            if len(exc.args) >= 3 and exc.args[2]:
+                desc = str(exc.args[2][2])
+                if "too long" in desc.lower() or "데이터가 너무 길어서" in desc:
+                    return True
+                code = exc.args[2][5]
+                if code == -2146827284:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _paste_formats_in_chunks(self, excel, source_sheet, target_sheet, start_row, end_row, start_col, end_col):
+        col_count = end_col - start_col + 1
+        if col_count <= 0:
+            return
+        max_cells = 200000
+        row_chunk = max(1, min(end_row - start_row + 1, max_cells // col_count))
+        for row in range(start_row, end_row + 1, row_chunk):
+            chunk_end = min(end_row, row + row_chunk - 1)
+            try:
+                src = source_sheet.Range(source_sheet.Cells(row, start_col), source_sheet.Cells(chunk_end, end_col))
+                dst = target_sheet.Range(target_sheet.Cells(row, start_col), target_sheet.Cells(chunk_end, end_col))
+                src.Copy()
+                dst.PasteSpecial(self.constants["xlPasteFormats"])
+            finally:
+                try:
+                    excel.CutCopyMode = False
+                except Exception:
+                    pass
 
     def _copy_outline(self, source_sheet, target_sheet, start_row, end_row, start_col, end_col):
         try:
