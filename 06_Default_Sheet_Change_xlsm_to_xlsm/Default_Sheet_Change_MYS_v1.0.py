@@ -99,19 +99,19 @@ class ExcelCopier:
             excel.EnableEvents = True
             excel.Quit()
         if exclude_sheet_names and post_delete_targets:
-            excel_cleanup = win32.DispatchEx("Excel.Application")
-            excel_cleanup.Visible = False
-            excel_cleanup.DisplayAlerts = False
-            excel_cleanup.EnableEvents = False
-            try:
-                for target in post_delete_targets:
-                    if cancel_cb and cancel_cb():
-                        break
+            for target in post_delete_targets:
+                if cancel_cb and cancel_cb():
+                    break
+                excel_cleanup = win32.DispatchEx("Excel.Application")
+                excel_cleanup.Visible = False
+                excel_cleanup.DisplayAlerts = False
+                excel_cleanup.EnableEvents = False
+                try:
                     self._delete_sheets_in_file(excel_cleanup, target, exclude_sheet_names, cancel_cb=cancel_cb)
-            finally:
-                excel_cleanup.DisplayAlerts = True
-                excel_cleanup.EnableEvents = True
-                excel_cleanup.Quit()
+                finally:
+                    excel_cleanup.DisplayAlerts = True
+                    excel_cleanup.EnableEvents = True
+                    excel_cleanup.Quit()
 
     def _collect_excel_files(self, folder: Path):
         files = []
@@ -239,6 +239,12 @@ class ExcelCopier:
             if not key:
                 continue
             sheet = sheet_map.get(key)
+            if sheet is None:
+                # Fallback: partial match to handle hidden/unexpected characters
+                for norm_name, ws in sheet_map.items():
+                    if key in norm_name:
+                        sheet = ws
+                        break
             if sheet is None:
                 self.logger(f"  - Exclude: sheet '{sheet_name}' not found in default file, skipped.")
                 continue
