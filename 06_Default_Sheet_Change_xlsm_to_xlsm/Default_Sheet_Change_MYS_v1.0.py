@@ -7,6 +7,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
+import unicodedata
 
 import pywintypes
 import win32com.client as win32
@@ -49,6 +50,7 @@ class ExcelCopier:
         excel.DisplayAlerts = False
         excel.EnableEvents = False
 
+        post_delete_targets = []
         try:
             base_name = main_file.stem
             ext = main_file.suffix
@@ -85,6 +87,9 @@ class ExcelCopier:
                     final_target.unlink()
                 temp_target.rename(final_target)
 
+                if exclude_sheet_names:
+                    post_delete_targets.append(final_target)
+
                 self.logger(f"[{idx}/{len(excel_files)}] Done -> {file_name}")
                 if progress_cb:
                     progress_cb(idx, total)
@@ -93,6 +98,20 @@ class ExcelCopier:
             excel.DisplayAlerts = True
             excel.EnableEvents = True
             excel.Quit()
+        if exclude_sheet_names and post_delete_targets:
+            excel_cleanup = win32.DispatchEx("Excel.Application")
+            excel_cleanup.Visible = False
+            excel_cleanup.DisplayAlerts = False
+            excel_cleanup.EnableEvents = False
+            try:
+                for target in post_delete_targets:
+                    if cancel_cb and cancel_cb():
+                        break
+                    self._delete_sheets_in_file(excel_cleanup, target, exclude_sheet_names, cancel_cb=cancel_cb)
+            finally:
+                excel_cleanup.DisplayAlerts = True
+                excel_cleanup.EnableEvents = True
+                excel_cleanup.Quit()
 
     def _collect_excel_files(self, folder: Path):
         files = []
@@ -137,8 +156,6 @@ class ExcelCopier:
 
             # Copy missing defined names to avoid #NAME? errors when formulas rely on them
             self._copy_missing_names(source_wb, target_wb)
-            if exclude_sheet_names:
-                self._delete_sheets(target_wb, exclude_sheet_names)
             try:
                 excel.CalculateFullRebuild()
             except Exception:
@@ -208,27 +225,52 @@ class ExcelCopier:
         except Exception:
             return None
 
+    def _normalize_sheet_name(self, name):
+        return unicodedata.normalize("NFKC", str(name)).strip().casefold()
+
     def _delete_sheets(self, workbook, sheet_names):
         if not sheet_names:
             return
+        sheet_map = {self._normalize_sheet_name(ws.Name): ws for ws in workbook.Worksheets}
         for sheet_name in sheet_names:
-            sheet_name = sheet_name.strip()
             if not sheet_name:
                 continue
-            sheet = self._get_sheet(workbook, sheet_name)
+            key = self._normalize_sheet_name(sheet_name)
+            if not key:
+                continue
+            sheet = sheet_map.get(key)
             if sheet is None:
                 self.logger(f"  - Exclude: sheet '{sheet_name}' not found in default file, skipped.")
                 continue
             try:
+                sheet_display_name = sheet.Name
                 if workbook.Worksheets.Count <= 1:
                     self.logger(
-                        f"  - Exclude: cannot delete '{sheet_name}' because it is the last remaining sheet."
+                        f"  - Exclude: cannot delete '{sheet_display_name}' because it is the last remaining sheet."
                     )
                     continue
                 sheet.Delete()
-                self.logger(f"  - Exclude: deleted sheet '{sheet_name}' from output.")
+                self.logger(f"  - Exclude: deleted sheet '{sheet_display_name}' from output.")
             except Exception:
-                self.logger(f"  - Exclude: failed to delete sheet '{sheet_name}', skipped.")
+                try:
+                    sheet_display_name = sheet_display_name
+                except Exception:
+                    sheet_display_name = sheet_name
+                self.logger(f"  - Exclude: failed to delete sheet '{sheet_display_name}', skipped.")
+
+    def _delete_sheets_in_file(self, excel, file_path: Path, sheet_names, cancel_cb=None):
+        if cancel_cb and cancel_cb():
+            return
+        wb = excel.Workbooks.Open(str(file_path))
+        try:
+            self._delete_sheets(wb, sheet_names)
+            try:
+                excel.CalculateFullRebuild()
+            except Exception:
+                pass
+            wb.Save()
+        finally:
+            wb.Close(SaveChanges=False)
 
     def _is_paste_too_long_error(self, exc):
         try:
