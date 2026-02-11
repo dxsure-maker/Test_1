@@ -3,7 +3,7 @@ name: build-win-exe
 on:
   push:
     paths:
-      - "06_Default_Sheet_Change_xlsm_to_xlsm/Default_Sheet_Change_MYS_v1.0.py"
+      - "06_Default_Sheet_Change_xlsm_to_xlsm/Default_Sheet_Change_MYS_v1.0_eCF.py"
       - ".github/workflows/build-win-exe.yml"
   workflow_dispatch:
 
@@ -26,10 +26,10 @@ jobs:
 
       - name: Build exe
         run: |
-          pyinstaller --onefile --noconsole --name Default_Sheet_Change_MYS_v1.0 "06_Default_Sheet_Change_xlsm_to_xlsm/Default_Sheet_Change_MYS_v1.0.py"
+          pyinstaller --onefile --noconsole --name Default_Sheet_Change_MYS_v1.0_eCF "06_Default_Sheet_Change_xlsm_to_xlsm/Default_Sheet_Change_MYS_v1.0_eCF.py"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Default_Sheet_Change_MYS_v1.0
-          path: dist/Default_Sheet_Change_MYS_v1.0.exe
+          name: Default_Sheet_Change_MYS_v1.0_eCF
+          path: dist/Default_Sheet_Change_MYS_v1.0_eCF.exe
