@@ -996,7 +996,7 @@ class App:
         ttk.Label(progress_meta, textvariable=self.progress_text, style="Value.TLabel").grid(
             row=0, column=1, sticky="w", padx=(8, 0)
         )
-        ttk.Label(progress_meta, text="예상 남은 시간:", style="Hint.TLabel").grid(row=0, column=2, sticky="w", padx=(24, 0))
+        ttk.Label(progress_meta, text="남은 예상 시간:", style="Hint.TLabel").grid(row=0, column=2, sticky="w", padx=(24, 0))
         ttk.Label(progress_meta, textvariable=self.eta_text, style="Value.TLabel").grid(
             row=0, column=3, sticky="w", padx=(8, 0)
         )
@@ -1005,7 +1005,7 @@ class App:
         button_area.grid(row=0, column=1, sticky="e", padx=(16, 0))
         self.cancel_btn = ttk.Button(button_area, text="중단", command=self.cancel_run, style="Secondary.TButton")
         self.cancel_btn.grid(row=0, column=0, padx=(0, 10))
-        self.run_btn = ttk.Button(button_area, text="수행", command=self.run, style="Accent.TButton")
+        self.run_btn = ttk.Button(button_area, text="실행", command=self.run, style="Accent.TButton")
         self.run_btn.grid(row=0, column=1)
 
     def pick_main_file(self):
