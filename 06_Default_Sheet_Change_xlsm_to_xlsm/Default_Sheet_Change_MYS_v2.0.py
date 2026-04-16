@@ -1,4 +1,3 @@
-import os
 import shutil
 import threading
 import traceback
@@ -9,8 +8,42 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 import unicodedata
 
-import pywintypes
-import win32com.client as win32
+try:
+    import pywintypes  # type: ignore[reportMissingModuleSource]
+    import win32com.client as win32  # type: ignore[reportMissingModuleSource]
+except ModuleNotFoundError as exc:
+    project_root = Path(__file__).resolve().parents[1]
+    venv_python = project_root / ".venv" / "Scripts" / "python.exe"
+    raise SystemExit(
+        "Missing dependency: pywin32 is not installed for this Python interpreter.\n"
+        f"Run the app with the project virtualenv instead:\n{venv_python}\n"
+        "Example:\n"
+        f"  & '{venv_python}' '{Path(__file__).resolve()}'"
+    ) from exc
+
+
+EXCEL_SOURCE_SUFFIXES = {".xlsx", ".xlsm"}
+
+
+def is_processable_excel_file_name(name: str) -> bool:
+    """Return True only for real user workbooks, not Excel lock/temp files."""
+    path = Path(name)
+    return path.suffix.lower() in EXCEL_SOURCE_SUFFIXES and not path.name.startswith("~$")
+
+
+def scan_excel_source_files(folder: Path):
+    files = []
+    ignored_temp_files = []
+    for entry in folder.iterdir():
+        if not entry.is_file():
+            continue
+        if entry.suffix.lower() not in EXCEL_SOURCE_SUFFIXES:
+            continue
+        if entry.name.startswith("~$"):
+            ignored_temp_files.append(entry.name)
+            continue
+        files.append(entry.name)
+    return sorted(files, key=str.lower), sorted(ignored_temp_files, key=str.lower)
 
 
 class ExcelCopier:
@@ -31,11 +64,23 @@ class ExcelCopier:
         progress_cb=None,
         cancel_cb=None,
     ):
-        excel_files = self._collect_excel_files(target_folder)
+        excel_files, ignored_temp_files = self._collect_excel_files(target_folder)
         if not excel_files:
+            if ignored_temp_files:
+                raise RuntimeError(
+                    "No usable Excel files found in the target folder. "
+                    "Excel temp/lock files (~$*.xlsx, ~$*.xlsm) are ignored."
+                )
             raise RuntimeError("No Excel files (*.xlsx, *.xlsm) found in the target folder.")
 
         self.logger(f"Found {len(excel_files)} file(s) to process.")
+        if ignored_temp_files:
+            preview = ", ".join(ignored_temp_files[:3])
+            if len(ignored_temp_files) > 3:
+                preview += ", ..."
+            self.logger(
+                f"Ignored {len(ignored_temp_files)} Excel temp/lock file(s): {preview}"
+            )
 
         # Prepare output folder under the target folder
         output_folder = target_folder / output_subfolder
@@ -135,11 +180,7 @@ class ExcelCopier:
                     excel_cleanup.Quit()
 
     def _collect_excel_files(self, folder: Path):
-        files = []
-        for entry in folder.iterdir():
-            if entry.is_file() and entry.suffix.lower() in {".xlsx", ".xlsm"}:
-                files.append(entry.name)
-        return sorted(files, key=str.lower)
+        return scan_excel_source_files(folder)
 
     def _copy_multiple_sheets(
         self,
@@ -678,7 +719,7 @@ class ExcelCopier:
             "xlCalculationAutomatic": -4105,
         }
         try:
-            from win32com.client import constants as excel_consts
+            from win32com.client import constants as excel_consts  # type: ignore[reportMissingModuleSource]
             for key, default in list(consts.items()):
                 consts[key] = getattr(excel_consts, key, default)
         except Exception:
@@ -1027,9 +1068,9 @@ class App:
         self.file_list.delete(0, tk.END)
         if not folder.exists():
             return
-        for name in sorted(os.listdir(folder), key=str.lower):
-            if name.lower().endswith((".xlsx", ".xlsm")):
-                self.file_list.insert(tk.END, name)
+        files, _ignored_temp_files = scan_excel_source_files(folder)
+        for name in files:
+            self.file_list.insert(tk.END, name)
 
     def run(self):
         if self.running:
