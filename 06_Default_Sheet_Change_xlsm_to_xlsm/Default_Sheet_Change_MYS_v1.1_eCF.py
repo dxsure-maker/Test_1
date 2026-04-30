@@ -587,30 +587,69 @@ class ExcelCopier:
                 pass
 
     def _copy_missing_names(self, source_wb, target_wb):
-        normalize = self._normalize_sheet_name
-        existing = {normalize(n.Name) for n in target_wb.Names}
+        existing = {self._defined_name_key(n) for n in target_wb.Names}
         for name_obj in source_wb.Names:
-            key = normalize(name_obj.Name)
+            key = self._defined_name_key(name_obj)
             if key in existing:
                 continue
-            # Prefer workbook scope; fall back to sheet scope if needed
             try:
-                target_wb.Names.Add(Name=name_obj.Name, RefersTo=name_obj.RefersTo)
+                refers_to = str(name_obj.RefersTo)
+            except Exception:
+                refers_to = ""
+
+            # Invalid Excel names like =#REF!#REF! cannot be recreated reliably.
+            # Skip them quietly so they don't flood the log with warnings.
+            if "#REF!" in refers_to.upper():
                 existing.add(key)
                 continue
+
+            local_name = self._defined_name_local_part(name_obj.Name)
+            is_sheet_scoped = "!" in str(name_obj.Name)
+
+            try:
+                if not is_sheet_scoped:
+                    target_wb.Names.Add(Name=local_name, RefersTo=refers_to)
+                    existing.add(key)
+                    continue
             except Exception:
                 pass
+
             try:
                 parent = getattr(name_obj, "Parent", None)
-                if parent is not None and getattr(parent, "Name", None):
-                    ws = self._get_sheet(target_wb, parent.Name)
+                parent_name = getattr(parent, "Name", None)
+                if is_sheet_scoped and parent_name:
+                    ws = self._get_sheet(target_wb, parent_name)
                     if ws is not None:
-                        ws.Names.Add(Name=name_obj.Name, RefersTo=name_obj.RefersTo)
+                        ws.Names.Add(Name=local_name, RefersTo=refers_to)
                         existing.add(key)
                         continue
             except Exception:
                 pass
+
+            try:
+                if not is_sheet_scoped:
+                    target_wb.Names.Add(Name=name_obj.Name, RefersTo=refers_to)
+                    existing.add(key)
+                    continue
+            except Exception:
+                pass
+
             self.logger(f"  - Warning: failed to copy defined name '{name_obj.Name}'")
+
+    def _defined_name_local_part(self, name):
+        text = str(name)
+        if "!" in text:
+            return text.split("!", 1)[1]
+        return text
+
+    def _defined_name_key(self, name_obj):
+        name = str(getattr(name_obj, "Name", ""))
+        local_name = self._normalize_sheet_name(self._defined_name_local_part(name))
+        if "!" in name:
+            parent = getattr(name_obj, "Parent", None)
+            parent_name = getattr(parent, "Name", "")
+            return ("sheet", self._normalize_sheet_name(parent_name), local_name)
+        return ("workbook", local_name)
 
     def _build_constants(self):
         consts = {"xlPasteFormats": -4122, "xlCellTypeLastCell": 11}
