@@ -1,0 +1,12 @@
+.venv/
+build/
+dist/
+__pycache__/
+*.py[cod]
+*.spec
+
+# Generated converter outputs when the project folder is selected as output.
+SWITC_*.tst
+SWITC_*.log
+*_unmerge.xlsx
+*_unmerge.xlsm
