@@ -18,7 +18,12 @@ from tkinter import (
 )
 from tkinter import ttk
 
-from openpyxl import load_workbook
+try:
+    import pythoncom
+    import win32com.client
+except ImportError:
+    pythoncom = None
+    win32com = None
 
 
 APP_TITLE = "Result_Date_Value_Change_MYS_v0.1"
@@ -27,6 +32,7 @@ RUN_LOG_PATH = APP_DIR / "Result_Date_Value_Change_MYS_v0.1_run.log"
 ERROR_LOG_PATH = APP_DIR / "Result_Date_Value_Change_MYS_v0.1_error.log"
 EXCEL_EXTENSIONS = {".xlsx", ".xlsm"}
 TIMESTAMP_SUFFIX_PATTERN = re.compile(r"^(?P<prefix>.+_)(?P<timestamp>\d+)$")
+EXCEL_SERIAL_EPOCH = datetime(1899, 12, 30)
 
 
 def write_run_log(message: str) -> None:
@@ -315,13 +321,14 @@ class ResultDateValueChangeApp:
         current_files = list(self.files)
 
         if summary_dt is not None:
-            for file_path in current_files:
-                try:
-                    self.change_summary_cell(file_path, summary_dt)
-                except Exception as exc:
-                    failures.append(f"{file_path.name}: Summary 변경 실패 - {exc}")
-                completed += 1
-                self.progress_queue.put(("progress", completed, total_steps, start_time))
+            completed = self.change_summary_cells(
+                current_files,
+                summary_dt,
+                failures,
+                completed,
+                total_steps,
+                start_time,
+            )
 
         if filename_dt is not None:
             renamed_files: list[Path] = []
@@ -341,18 +348,75 @@ class ResultDateValueChangeApp:
 
         self.progress_queue.put(("done", failures))
 
-    def change_summary_cell(self, file_path: Path, dt_value: datetime) -> None:
-        workbook = load_workbook(file_path, keep_vba=file_path.suffix.lower() == ".xlsm")
-        try:
-            if "summary" not in workbook.sheetnames:
-                raise ValueError("summary 시트가 없습니다.")
+    def change_summary_cells(
+        self,
+        file_paths: list[Path],
+        dt_value: datetime,
+        failures: list[str],
+        completed: int,
+        total_steps: int,
+        start_time: float,
+    ) -> int:
+        if pythoncom is None or win32com is None:
+            for file_path in file_paths:
+                failures.append(
+                    f"{file_path.name}: Summary 변경 실패 - pywin32가 설치되어 있지 않아 Excel 저장을 사용할 수 없습니다."
+                )
+                completed += 1
+                self.progress_queue.put(("progress", completed, total_steps, start_time))
+            return completed
 
-            worksheet = workbook["summary"]
-            worksheet["B7"] = dt_value
-            worksheet["B7"].number_format = "yyyy-mm-dd  h:mm:ss AM/PM"
-            workbook.save(file_path)
+        pythoncom.CoInitialize()
+        excel = None
+        try:
+            excel = win32com.client.DispatchEx("Excel.Application")
+            excel.Visible = False
+            excel.DisplayAlerts = False
+            excel.EnableEvents = False
+            try:
+                excel.AskToUpdateLinks = False
+            except Exception:
+                pass
+
+            for file_path in file_paths:
+                workbook = None
+                try:
+                    workbook = excel.Workbooks.Open(
+                        str(file_path.resolve()),
+                        UpdateLinks=0,
+                        ReadOnly=False,
+                        IgnoreReadOnlyRecommended=True,
+                        AddToMru=False,
+                    )
+                    worksheet = workbook.Worksheets("summary")
+                    cell = worksheet.Range("B7")
+                    cell.Value2 = self.datetime_to_excel_serial(dt_value)
+                    cell.NumberFormat = "yyyy-mm-dd  h:mm:ss AM/PM"
+                    workbook.Save()
+                except Exception as exc:
+                    failures.append(f"{file_path.name}: Summary 변경 실패 - {exc}")
+                finally:
+                    if workbook is not None:
+                        try:
+                            workbook.Close(SaveChanges=False)
+                        except Exception:
+                            pass
+                    completed += 1
+                    self.progress_queue.put(("progress", completed, total_steps, start_time))
         finally:
-            workbook.close()
+            if excel is not None:
+                try:
+                    excel.Quit()
+                except Exception:
+                    pass
+            pythoncom.CoUninitialize()
+
+        return completed
+
+    @staticmethod
+    def datetime_to_excel_serial(dt_value: datetime) -> float:
+        delta = dt_value - EXCEL_SERIAL_EPOCH
+        return delta.days + (delta.seconds + delta.microseconds / 1_000_000) / 86400
 
     def change_file_name(self, file_path: Path, timestamp: str) -> Path | None:
         stem = file_path.stem
