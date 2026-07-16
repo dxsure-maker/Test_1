@@ -7,7 +7,8 @@ import threading
 import time
 import traceback
 from datetime import datetime
-from pathlib import Path
+from html import unescape
+from pathlib import Path, PurePosixPath
 from tkinter import (
     BooleanVar,
     Listbox,
@@ -17,13 +18,9 @@ from tkinter import (
     messagebox,
 )
 from tkinter import ttk
-
-try:
-    import pythoncom
-    import win32com.client
-except ImportError:
-    pythoncom = None
-    win32com = None
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape
+from zipfile import ZIP_DEFLATED, ZipFile
 
 
 APP_TITLE = "Result_Date_Value_Change_MYS_v0.1"
@@ -33,6 +30,11 @@ ERROR_LOG_PATH = APP_DIR / "Result_Date_Value_Change_MYS_v0.1_error.log"
 EXCEL_EXTENSIONS = {".xlsx", ".xlsm"}
 TIMESTAMP_SUFFIX_PATTERN = re.compile(r"^(?P<prefix>.+_)(?P<timestamp>\d+)$")
 EXCEL_SERIAL_EPOCH = datetime(1899, 12, 30)
+SUMMARY_DATE_FORMAT = "yyyy-mm-dd  h:mm:ss AM/PM"
+SPREADSHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+OFFICE_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+REL_ID_ATTR = f"{{{OFFICE_REL_NS}}}id"
 
 
 def write_run_log(message: str) -> None:
@@ -357,66 +359,242 @@ class ResultDateValueChangeApp:
         total_steps: int,
         start_time: float,
     ) -> int:
-        if pythoncom is None or win32com is None:
-            for file_path in file_paths:
-                failures.append(
-                    f"{file_path.name}: Summary 변경 실패 - pywin32가 설치되어 있지 않아 Excel 저장을 사용할 수 없습니다."
-                )
-                completed += 1
-                self.progress_queue.put(("progress", completed, total_steps, start_time))
-            return completed
-
-        pythoncom.CoInitialize()
-        excel = None
-        try:
-            excel = win32com.client.DispatchEx("Excel.Application")
-            excel.Visible = False
-            excel.DisplayAlerts = False
-            excel.EnableEvents = False
+        for file_path in file_paths:
             try:
-                excel.AskToUpdateLinks = False
-            except Exception:
-                pass
-
-            for file_path in file_paths:
-                workbook = None
-                try:
-                    workbook = excel.Workbooks.Open(
-                        str(file_path.resolve()),
-                        UpdateLinks=0,
-                        ReadOnly=False,
-                        IgnoreReadOnlyRecommended=True,
-                        AddToMru=False,
-                    )
-                    worksheet = workbook.Worksheets("summary")
-                    cell = worksheet.Range("B7")
-                    cell.Value2 = self.datetime_to_excel_serial(dt_value)
-                    cell.NumberFormat = "yyyy-mm-dd  h:mm:ss AM/PM"
-                    workbook.Save()
-                except Exception as exc:
-                    failures.append(f"{file_path.name}: Summary 변경 실패 - {exc}")
-                finally:
-                    if workbook is not None:
-                        try:
-                            workbook.Close(SaveChanges=False)
-                        except Exception:
-                            pass
-                    completed += 1
-                    self.progress_queue.put(("progress", completed, total_steps, start_time))
-        finally:
-            if excel is not None:
-                try:
-                    excel.Quit()
-                except Exception:
-                    pass
-            pythoncom.CoUninitialize()
+                self.change_summary_cell(file_path, dt_value)
+            except Exception as exc:
+                failures.append(f"{file_path.name}: Summary 변경 실패 - {exc}")
+            completed += 1
+            self.progress_queue.put(("progress", completed, total_steps, start_time))
 
         return completed
+
+    def change_summary_cell(self, file_path: Path, dt_value: datetime) -> None:
+        serial_text = self.format_excel_serial(self.datetime_to_excel_serial(dt_value))
+        temp_path = file_path.with_name(f"{file_path.name}.tmp")
+        summary_sheet_path = None
+        patched_styles_xml = None
+        date_style_id = None
+
+        try:
+            with ZipFile(file_path, "r") as source_zip:
+                summary_sheet_path = self.find_summary_sheet_path(source_zip)
+                summary_sheet_xml = source_zip.read(summary_sheet_path)
+                base_style_id = self.get_b7_style_id(summary_sheet_xml)
+                if "xl/styles.xml" in source_zip.namelist():
+                    patched_styles_xml, date_style_id = self.ensure_summary_date_style(
+                        source_zip.read("xl/styles.xml"),
+                        base_style_id,
+                    )
+                with ZipFile(temp_path, "w", compression=ZIP_DEFLATED, allowZip64=True) as target_zip:
+                    for item in source_zip.infolist():
+                        data = source_zip.read(item.filename)
+                        if item.filename == summary_sheet_path:
+                            data = self.patch_b7_value(data, serial_text, date_style_id)
+                        elif item.filename == "xl/styles.xml" and patched_styles_xml is not None:
+                            data = patched_styles_xml
+                        target_zip.writestr(item, data)
+                    target_zip.comment = source_zip.comment
+            os.replace(temp_path, file_path)
+        except Exception:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
+            raise
+
+        if summary_sheet_path is None:
+            raise ValueError("summary 시트 XML을 찾지 못했습니다.")
+
+    def find_summary_sheet_path(self, workbook_zip: ZipFile) -> str:
+        workbook_root = ET.fromstring(workbook_zip.read("xl/workbook.xml"))
+        summary_rel_id = None
+        for sheet in workbook_root.findall(f".//{{{SPREADSHEET_NS}}}sheet"):
+            if sheet.attrib.get("name", "").casefold() == "summary":
+                summary_rel_id = sheet.attrib.get(REL_ID_ATTR)
+                break
+        if not summary_rel_id:
+            raise ValueError("summary 시트가 없습니다.")
+
+        rels_root = ET.fromstring(workbook_zip.read("xl/_rels/workbook.xml.rels"))
+        for rel in rels_root.findall(f"{{{PACKAGE_REL_NS}}}Relationship"):
+            if rel.attrib.get("Id") == summary_rel_id:
+                target = rel.attrib.get("Target", "")
+                if target.startswith("/"):
+                    return target.lstrip("/")
+                return PurePosixPath("xl", target).as_posix()
+
+        raise ValueError("summary 시트 관계 정보를 찾지 못했습니다.")
+
+    @staticmethod
+    def get_b7_style_id(sheet_xml: bytes) -> int:
+        encoding = ResultDateValueChangeApp.detect_xml_encoding(sheet_xml)
+        xml_text = sheet_xml.decode(encoding)
+        match = re.search(r"<c\b(?=[^>]*\br=(['\"])B7\1)[^>]*\bs=(['\"])(\d+)\2", xml_text)
+        return int(match.group(3)) if match else 0
+
+    def ensure_summary_date_style(self, styles_xml: bytes, base_style_id: int) -> tuple[bytes, int]:
+        encoding = self.detect_xml_encoding(styles_xml)
+        styles_text = styles_xml.decode(encoding)
+        target_num_fmt_id = self.find_num_fmt_id(styles_text, SUMMARY_DATE_FORMAT)
+        if target_num_fmt_id is None:
+            target_num_fmt_id = self.next_custom_num_fmt_id(styles_text)
+            styles_text = self.insert_num_fmt(styles_text, target_num_fmt_id, SUMMARY_DATE_FORMAT)
+
+        cell_xfs_match = re.search(r"<cellXfs\b[^>]*>(.*?)</cellXfs>", styles_text, re.DOTALL)
+        if not cell_xfs_match:
+            raise ValueError("styles.xml에서 cellXfs를 찾지 못했습니다.")
+
+        xf_nodes = re.findall(r"<xf\b[^>]*(?:/>|>.*?</xf>)", cell_xfs_match.group(1), re.DOTALL)
+        if not xf_nodes:
+            raise ValueError("styles.xml에 셀 스타일 정보가 없습니다.")
+
+        base_xf = xf_nodes[base_style_id] if 0 <= base_style_id < len(xf_nodes) else xf_nodes[0]
+        expected_xf = self.with_date_num_fmt(base_xf, target_num_fmt_id)
+        for index, xf_node in enumerate(xf_nodes):
+            if xf_node == expected_xf:
+                return styles_text.encode(encoding), index
+
+        new_style_id = len(xf_nodes)
+        styles_text = styles_text[: cell_xfs_match.end(1)] + expected_xf + styles_text[cell_xfs_match.end(1) :]
+        updated_start_tag = self.set_xml_attr(cell_xfs_match.group(0).split(">", 1)[0] + ">", "count", str(new_style_id + 1))
+        styles_text = styles_text[: cell_xfs_match.start()] + updated_start_tag + styles_text[cell_xfs_match.start(1) :]
+        return styles_text.encode(encoding), new_style_id
+
+    @staticmethod
+    def find_num_fmt_id(styles_text: str, format_code: str) -> int | None:
+        for match in re.finditer(r"<numFmt\b[^>]*\bnumFmtId=(['\"])(\d+)\1[^>]*\bformatCode=(['\"])(.*?)\3[^>]*/?>", styles_text, re.DOTALL):
+            if unescape(match.group(4)) == format_code:
+                return int(match.group(2))
+        return None
+
+    @staticmethod
+    def next_custom_num_fmt_id(styles_text: str) -> int:
+        ids = [int(match.group(2)) for match in re.finditer(r"\bnumFmtId=(['\"])(\d+)\1", styles_text)]
+        return max([163, *ids]) + 1
+
+    def insert_num_fmt(self, styles_text: str, num_fmt_id: int, format_code: str) -> str:
+        escaped_format_code = escape(format_code, {'"': "&quot;"})
+        num_fmt_xml = f'<numFmt numFmtId="{num_fmt_id}" formatCode="{escaped_format_code}"/>'
+        num_fmts_match = re.search(r"<numFmts\b[^>]*>", styles_text)
+        if num_fmts_match:
+            close_index = styles_text.find("</numFmts>", num_fmts_match.end())
+            if close_index < 0:
+                raise ValueError("styles.xml의 numFmts 종료 태그를 찾지 못했습니다.")
+            current_count = len(re.findall(r"<numFmt\b", styles_text[num_fmts_match.end() : close_index]))
+            styles_text = styles_text[:close_index] + num_fmt_xml + styles_text[close_index:]
+            updated_start_tag = self.set_xml_attr(num_fmts_match.group(0), "count", str(current_count + 1))
+            return styles_text[: num_fmts_match.start()] + updated_start_tag + styles_text[num_fmts_match.end() :]
+
+        style_sheet_match = re.search(r"<styleSheet\b[^>]*>", styles_text)
+        if not style_sheet_match:
+            raise ValueError("styles.xml의 styleSheet 시작 태그를 찾지 못했습니다.")
+        num_fmts_xml = f'<numFmts count="1">{num_fmt_xml}</numFmts>'
+        return styles_text[: style_sheet_match.end()] + num_fmts_xml + styles_text[style_sheet_match.end() :]
+
+    @staticmethod
+    def with_date_num_fmt(xf_xml: str, num_fmt_id: int) -> str:
+        start_end = xf_xml.find(">")
+        start_tag = xf_xml[: start_end + 1]
+        tail = xf_xml[start_end + 1 :]
+        start_tag = ResultDateValueChangeApp.set_xml_attr(start_tag, "numFmtId", str(num_fmt_id))
+        start_tag = ResultDateValueChangeApp.set_xml_attr(start_tag, "applyNumberFormat", "1")
+        return start_tag + tail
+
+    @staticmethod
+    def set_xml_attr(start_tag: str, name: str, value: str) -> str:
+        attr_pattern = rf"\s+{re.escape(name)}=(['\"]).*?\1"
+        replacement = f' {name}="{value}"'
+        if re.search(attr_pattern, start_tag, re.DOTALL):
+            return re.sub(attr_pattern, replacement, start_tag, count=1, flags=re.DOTALL)
+        insert_at = start_tag.rfind("/>") if start_tag.rstrip().endswith("/>") else start_tag.rfind(">")
+        if insert_at < 0:
+            raise ValueError("XML 시작 태그 형식이 올바르지 않습니다.")
+        return start_tag[:insert_at] + replacement + start_tag[insert_at:]
+
+    def patch_b7_value(self, sheet_xml: bytes, serial_text: str, style_id: int | None) -> bytes:
+        encoding = self.detect_xml_encoding(sheet_xml)
+        xml_text = sheet_xml.decode(encoding)
+        cell_pattern = re.compile(
+            r"(<c\b(?=[^>]*\br=(['\"])B7\2)[^>]*)(?:>(.*?)</c>|/>)",
+            re.DOTALL,
+        )
+
+        def replace_cell(match: re.Match) -> str:
+            start_tag = re.sub(r"\s+t=(['\"]).*?\1", "", match.group(1), flags=re.DOTALL)
+            if style_id is not None:
+                if re.search(r"\s+s=(['\"])\d+\1", start_tag):
+                    start_tag = re.sub(r"\s+s=(['\"])\d+\1", f' s="{style_id}"', start_tag, count=1)
+                else:
+                    start_tag = f'{start_tag} s="{style_id}"'
+            body = match.group(3)
+            if body is None:
+                return f"{start_tag}><v>{serial_text}</v></c>"
+
+            body = re.sub(r"<is\b.*?</is>", "", body, flags=re.DOTALL)
+            if re.search(r"<v>.*?</v>", body, flags=re.DOTALL):
+                body = re.sub(r"<v>.*?</v>", f"<v>{serial_text}</v>", body, count=1, flags=re.DOTALL)
+            else:
+                body = f"<v>{serial_text}</v>{body}"
+            return f"{start_tag}>{body}</c>"
+
+        patched_text, replace_count = cell_pattern.subn(replace_cell, xml_text, count=1)
+        if replace_count:
+            return patched_text.encode(encoding)
+
+        return self.patch_b7_value_with_xml_parser(sheet_xml, serial_text, style_id)
+
+    @staticmethod
+    def detect_xml_encoding(xml_bytes: bytes) -> str:
+        match = re.match(br"\s*<\?xml[^>]*encoding=[\"']([^\"']+)[\"']", xml_bytes)
+        if match:
+            return match.group(1).decode("ascii")
+        return "utf-8"
+
+    @staticmethod
+    def patch_b7_value_with_xml_parser(sheet_xml: bytes, serial_text: str, style_id: int | None) -> bytes:
+        ET.register_namespace("", SPREADSHEET_NS)
+        root = ET.fromstring(sheet_xml)
+        sheet_data = root.find(f"{{{SPREADSHEET_NS}}}sheetData")
+        if sheet_data is None:
+            raise ValueError("summary 시트의 sheetData를 찾지 못했습니다.")
+
+        row = None
+        for candidate in sheet_data.findall(f"{{{SPREADSHEET_NS}}}row"):
+            if candidate.attrib.get("r") == "7":
+                row = candidate
+                break
+        if row is None:
+            row = ET.SubElement(sheet_data, f"{{{SPREADSHEET_NS}}}row", {"r": "7"})
+
+        cell = None
+        for candidate in row.findall(f"{{{SPREADSHEET_NS}}}c"):
+            if candidate.attrib.get("r") == "B7":
+                cell = candidate
+                break
+        if cell is None:
+            cell = ET.SubElement(row, f"{{{SPREADSHEET_NS}}}c", {"r": "B7"})
+
+        cell.attrib.pop("t", None)
+        if style_id is not None:
+            cell.set("s", str(style_id))
+        for child in list(cell):
+            if child.tag in {f"{{{SPREADSHEET_NS}}}v", f"{{{SPREADSHEET_NS}}}is"}:
+                cell.remove(child)
+        value_node = ET.Element(f"{{{SPREADSHEET_NS}}}v")
+        value_node.text = serial_text
+        cell.insert(0, value_node)
+        return ET.tostring(root, encoding="utf-8", xml_declaration=sheet_xml.lstrip().startswith(b"<?xml"))
 
     @staticmethod
     def datetime_to_excel_serial(dt_value: datetime) -> float:
         delta = dt_value - EXCEL_SERIAL_EPOCH
         return delta.days + (delta.seconds + delta.microseconds / 1_000_000) / 86400
+
+    @staticmethod
+    def format_excel_serial(serial_value: float) -> str:
+        return f"{serial_value:.10f}".rstrip("0").rstrip(".")
 
     def change_file_name(self, file_path: Path, timestamp: str) -> Path | None:
         stem = file_path.stem
